@@ -21,12 +21,14 @@
  *   filekeeper.exe                                    интерактивное меню (запуск / установка / удаление)
  *   node index.js <источник> <назначение> [--debounce=500] [--no-delete] [--verbose] [--lang=ru|en]
  *   node index.js --config=filekeeper.json [--lang=ru|en]   запуск по конфиг-файлу
- *   node index.js install   [--config=...] [--name=FileKeeper]  установить в автозагрузку (Планировщик заданий)
+ *   node index.js install   [--config=...] [--name=FileKeeper]  установить в автозагрузку
  *   node index.js uninstall [--name=FileKeeper]                 удалить из автозагрузки
- *   node index.js status    [--name=FileKeeper]                 проверить состояние задачи
+ *   node index.js status    [--name=FileKeeper]                 проверить состояние
  *
- * Установка и удаление через меню автоматически запрашивают права
- * администратора (UAC), если утилита запущена без них.
+ * Автозагрузка: Windows — Планировщик заданий (скрытый запуск через VBS),
+ * Linux — systemd user unit, macOS — LaunchAgent. Установка и удаление через
+ * меню на Windows автоматически запрашивают права администратора (UAC), если
+ * утилита запущена без них; на Linux/macOS права root не нужны.
  *
  * Формат конфиг-файла (JSON):
  *   {
@@ -59,7 +61,7 @@
  * Поле "schedule" (строка или массив строк; глобально или на уровне задания):
  *   "daily HH:MM"          — ежедневно в указанное время
  *   "weekly <день> HH:MM"  — еженедельно (день: sun, mon, tue, wed, thu, fri, sat)
- *   "idle N"               — когда система простаивает N минут (только Windows)
+ *   "idle N"               — когда система простаивает N минут (Windows и macOS)
  *   "never" / отсутствует  — полная синхронизация не планируется
  * Если в момент расписания утилита не работала, синхронизация выполнится
  * при ближайшем запуске.
@@ -71,6 +73,7 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execSync, execFile, spawnSync } = require('child_process');
 const readline = require('readline');
@@ -686,8 +689,13 @@ function runJob(job, stateStore) {
         }
     }
 
-    // ----- Детект простоя системы (Windows, GetLastInputInfo) -----
+    // ----- Детект простоя системы -----
+    // Windows — GetLastInputInfo через PowerShell, macOS — HIDIdleTime из ioreg.
+    // На остальных платформах (Linux: нет единого способа — X11/Wayland/сервер)
+    // возвращаем null, а setupIdleWatcher заранее выводит предупреждение.
     function getIdleSeconds() {
+        if (process.platform === 'darwin') return getIdleSecondsMac();
+        if (process.platform !== 'win32') return Promise.resolve(null);
         return new Promise((resolve) => {
             const script = [
                 `$src = @'`,
@@ -718,11 +726,25 @@ function runJob(job, stateStore) {
         });
     }
 
+    // macOS: ioreg отдаёт HIDIdleTime в наносекундах
+    function getIdleSecondsMac() {
+        return new Promise((resolve) => {
+            execFile('ioreg', ['-c', 'IOHIDSystem'], { timeout: 15000 }, (err, stdout) => {
+                if (err) {
+                    verbose(t('idle_time_error', { error: err.message }));
+                    return resolve(null);
+                }
+                const m = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
+                resolve(m ? Math.floor(Number(m[1]) / 1e9) : null);
+            });
+        });
+    }
+
     function setupIdleWatcher() {
         const idleSchedules = schedules.filter((s) => s.type === 'idle');
         if (!idleSchedules.length) return;
-        if (process.platform !== 'win32') {
-            log('WARN', t('idle_windows_only', { tag }));
+        if (process.platform !== 'win32' && process.platform !== 'darwin') {
+            log('WARN', t('idle_platform_only', { tag }));
             return;
         }
         const threshold = Math.min(...idleSchedules.map((s) => s.minutes)) * 60;
@@ -908,49 +930,75 @@ function runJob(job, stateStore) {
     return { start, stop };
 }
 
-// ---------- Режим службы (Планировщик заданий Windows) ----------
+// ---------- Автозагрузка ----------
+// Windows — Планировщик заданий (скрытый запуск через VBS-обёртку),
+// Linux — systemd user unit, macOS — LaunchAgent. На unix прав root не нужно:
+// и user unit, и LaunchAgent работают в контексте текущего пользователя.
 async function serviceInstall(args) {
-    if (process.platform !== 'win32') {
-        console.error(t('install_windows_only'));
-        console.error(t('install_other_os_hint'));
+    const taskName = getArg(args, 'name') || DEFAULT_TASK_NAME;
+    const configPath = getArg(args, 'config')
+        ? path.resolve(getArg(args, 'config'))
+        : path.resolve(__dirname, 'filekeeper.json');
+
+    if (process.platform === 'win32') {
+        const configArg = `--config "${configPath}"`;
+        // Скрытый запуск без консольного окна через VBS-обёртку
+        const launcher = path.resolve(__dirname, 'filekeeper-launcher.vbs');
+        // В exe-сборке (SEA) скрипт уже встроен в бинарник — путь к index.js не нужен
+        const cmdParts = [`"${process.execPath}"`];
+        if (!isSea()) cmdParts.push(`"${path.join(__dirname, 'index.js')}"`);
+        cmdParts.push(configArg);
+        // В VBScript кавычки внутри строкового литерала удваиваются
+        const vbsCmd = cmdParts.join(' ').replace(/"/g, '""');
+        const vbs = [
+            `Set sh = CreateObject("Wscript.Shell")`,
+            `sh.CurrentDirectory = "${__dirname}"`,
+            `sh.Run "${vbsCmd}", 0, False`,
+        ].join('\r\n');
+        fs.writeFileSync(launcher, vbs);
+
+        execSync(
+            `schtasks /create /tn "${taskName}" /sc onlogon /rl highest /f ` +
+            `/tr "wscript.exe \\"${launcher}\\""`,
+            { stdio: 'inherit' }
+        );
+        console.log(t('task_installed', { name: taskName }));
+        console.log(t('task_run_now_win', { name: taskName }));
+    } else if (process.platform === 'linux') {
+        const unit = installSystemdUnit(taskName, configPath);
+        console.log(t('task_installed', { name: taskName }));
+        console.log(t('task_run_now_linux', { name: unit }));
+        console.log(t('linux_linger_hint'));
+    } else if (process.platform === 'darwin') {
+        const label = installLaunchAgent(taskName, configPath);
+        console.log(t('task_installed', { name: taskName }));
+        console.log(t('task_run_now_macos', { label }));
+    } else {
+        console.error(t('install_unsupported_os', { platform: process.platform }));
         process.exit(1);
     }
-
-    const taskName = getArg(args, 'name') || DEFAULT_TASK_NAME;
-    const configArg = getArg(args, 'config')
-        ? `--config "${path.resolve(getArg(args, 'config'))}"`
-        : `--config "${path.resolve(__dirname, 'filekeeper.json')}"`;
-
-    // Скрытый запуск без консольного окна через VBS-обёртку
-    const launcher = path.resolve(__dirname, 'filekeeper-launcher.vbs');
-    // В exe-сборке (SEA) скрипт уже встроен в бинарник — путь к index.js не нужен
-    const cmdParts = [`"${process.execPath}"`];
-    if (!isSea()) cmdParts.push(`"${path.join(__dirname, 'index.js')}"`);
-    cmdParts.push(configArg);
-    // В VBScript кавычки внутри строкового литерала удваиваются
-    const vbsCmd = cmdParts.join(' ').replace(/"/g, '""');
-    const vbs = [
-        `Set sh = CreateObject("Wscript.Shell")`,
-        `sh.CurrentDirectory = "${__dirname}"`,
-        `sh.Run "${vbsCmd}", 0, False`,
-    ].join('\r\n');
-    fs.writeFileSync(launcher, vbs);
-
-    execSync(
-        `schtasks /create /tn "${taskName}" /sc onlogon /rl highest /f ` +
-        `/tr "wscript.exe \\"${launcher}\\""`,
-        { stdio: 'inherit' }
-    );
-    console.log(t('task_installed', { name: taskName }));
-    console.log(t('task_run_now', { name: taskName }));
     if (args.includes('--pause')) await waitForEnter();
 }
 
 async function serviceUninstall(args) {
     const taskName = getArg(args, 'name') || DEFAULT_TASK_NAME;
-    execSync(`schtasks /delete /tn "${taskName}" /f`, { stdio: 'inherit' });
-    const launcher = path.resolve(__dirname, 'filekeeper-launcher.vbs');
-    fs.rmSync(launcher, { force: true });
+
+    if (process.platform === 'win32') {
+        execSync(`schtasks /delete /tn "${taskName}" /f`, { stdio: 'inherit' });
+        fs.rmSync(path.resolve(__dirname, 'filekeeper-launcher.vbs'), { force: true });
+    } else if (process.platform === 'linux') {
+        const unit = systemdUnitName(taskName);
+        try { execSync(`systemctl --user disable --now "${unit}"`, { stdio: 'inherit' }); } catch { }
+        fs.rmSync(systemdUnitPath(taskName), { force: true });
+        try { execSync('systemctl --user daemon-reload', { stdio: 'inherit' }); } catch { }
+    } else if (process.platform === 'darwin') {
+        const plistPath = launchdPlistPath(taskName);
+        try { execSync(`launchctl unload -w "${plistPath}"`, { stdio: 'inherit' }); } catch { }
+        fs.rmSync(plistPath, { force: true });
+    } else {
+        console.error(t('install_unsupported_os', { platform: process.platform }));
+        process.exit(1);
+    }
     console.log(t('task_removed', { name: taskName }));
     if (args.includes('--pause')) await waitForEnter();
 }
@@ -958,10 +1006,104 @@ async function serviceUninstall(args) {
 function serviceStatus(args) {
     const taskName = getArg(args, 'name') || DEFAULT_TASK_NAME;
     try {
-        execSync(`schtasks /query /tn "${taskName}"`, { stdio: 'inherit' });
+        if (process.platform === 'win32') {
+            execSync(`schtasks /query /tn "${taskName}"`, { stdio: 'inherit' });
+        } else if (process.platform === 'linux') {
+            execSync(`systemctl --user status "${systemdUnitName(taskName)}"`, { stdio: 'inherit' });
+        } else if (process.platform === 'darwin') {
+            process.stdout.write(execSync(`launchctl list | grep "${launchdLabel(taskName)}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+        } else {
+            console.error(t('install_unsupported_os', { platform: process.platform }));
+        }
     } catch {
         console.log(t('task_not_installed', { name: taskName }));
     }
+}
+
+// Аргументы командной строки, которыми служба запускает утилиту
+function serviceArgs(configPath) {
+    // В exe-сборке (SEA) скрипт уже встроен в бинарник — путь к index.js не нужен
+    const parts = [process.execPath];
+    if (!isSea()) parts.push(path.join(__dirname, 'index.js'));
+    parts.push('--config', configPath);
+    return parts;
+}
+
+// ----- Linux: systemd user unit -----
+// Имя unit: строчные буквы, только [a-z0-9_.-] (требование systemd)
+function systemdUnitName(taskName) {
+    return taskName.toLowerCase().replace(/[^a-z0-9_.-]+/g, '-');
+}
+
+function systemdUnitPath(taskName) {
+    return path.join(os.homedir(), '.config', 'systemd', 'user', `${systemdUnitName(taskName)}.service`);
+}
+
+function installSystemdUnit(taskName, configPath) {
+    const unit = systemdUnitName(taskName);
+    // В unit-файлах systemd путь с пробелами берётся в двойные кавычки
+    const q = (s) => `"${s.replace(/(["\\])/g, '\\$1')}"`;
+    const content = [
+        '[Unit]',
+        'Description=FileKeeper background backup',
+        '',
+        '[Service]',
+        `ExecStart=${serviceArgs(configPath).map(q).join(' ')}`,
+        `WorkingDirectory=${q(__dirname)}`,
+        'Restart=on-failure',
+        '',
+        '[Install]',
+        'WantedBy=default.target',
+        '',
+    ].join('\n');
+    const unitPath = systemdUnitPath(taskName);
+    fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+    fs.writeFileSync(unitPath, content);
+    execSync('systemctl --user daemon-reload', { stdio: 'inherit' });
+    execSync(`systemctl --user enable --now "${unit}"`, { stdio: 'inherit' });
+    return unit;
+}
+
+// ----- macOS: LaunchAgent -----
+function launchdLabel(taskName) {
+    return `com.filekeeper.${systemdUnitName(taskName)}`;
+}
+
+function launchdPlistPath(taskName) {
+    return path.join(os.homedir(), 'Library', 'LaunchAgents', `${launchdLabel(taskName)}.plist`);
+}
+
+const xmlEscape = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function installLaunchAgent(taskName, configPath) {
+    const label = launchdLabel(taskName);
+    const argsXml = serviceArgs(configPath).map((a) => `        <string>${xmlEscape(a)}</string>`).join('\n');
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${xmlEscape(label)}</string>
+    <key>ProgramArguments</key>
+    <array>
+${argsXml}
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${xmlEscape(__dirname)}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+`;
+    const plistPath = launchdPlistPath(taskName);
+    fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+    fs.writeFileSync(plistPath, plist);
+    // Если агент уже загружен — выгружаем, иначе load вернёт ошибку
+    try { execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' }); } catch { }
+    execSync(`launchctl load -w "${plistPath}"`, { stdio: 'inherit' });
+    return label;
 }
 
 // ---------- Интерактивное меню (запуск без аргументов) ----------
@@ -1019,12 +1161,14 @@ async function showMenu() {
     const choice = answer.trim();
     if (choice === '2' || choice === '3') {
         const cmd = choice === '2' ? 'install' : 'uninstall';
-        if (isElevated()) {
-            if (cmd === 'install') await serviceInstall([]);
-            else await serviceUninstall([]);
-        } else {
+        // Повышение прав нужно только на Windows (Планировщик заданий, UAC);
+        // на unix автозагрузка ставится в контексте текущего пользователя
+        if (process.platform === 'win32' && !isElevated()) {
             console.log(t('requesting_elevation'));
             runElevated([cmd]);
+        } else {
+            if (cmd === 'install') await serviceInstall([]);
+            else await serviceUninstall([]);
         }
         process.exit(0);
     }
@@ -1062,7 +1206,7 @@ async function main() {
         serviceStatus(args.slice(1));
     } else {
         // Запуск без аргументов (двойной клик по exe) — интерактивное меню
-        if (args.length === 0 && process.stdin.isTTY && process.platform === 'win32') {
+        if (args.length === 0 && process.stdin.isTTY) {
             await showMenu();
         }
 

@@ -1,6 +1,6 @@
 # FileKeeper
 
-A background backup utility for Windows. It watches a source directory and copies new and changed files to a destination directory — for example, an external or network drive.
+A background backup utility for Windows, Linux and macOS. It watches a source directory and copies new and changed files to a destination directory — for example, an external or network drive.
 
 ## Features
 
@@ -10,15 +10,15 @@ A background backup utility for Windows. It watches a source directory and copie
 - **Resilient to destination outages** — if the network/external drive is disconnected, synchronization pauses and resumes when the drive reappears. Real-time changes accumulated in the meantime are not lost.
 - **Resumable after interruption** — an interrupted synchronization starts over, but up-to-date files are skipped by size and mtime, so the re-scan is cheap.
 - **Multiple jobs** — any number of "source → destination" pairs with individual settings.
-- **Autostart** — installation into Windows Task Scheduler (runs at logon, hidden, no console window).
+- **Autostart** — installation into Windows Task Scheduler (runs at logon, hidden, no console window), a systemd user unit (Linux) or a LaunchAgent (macOS).
 - **Log file and live indicator** — a rotating log file (2 MB) and, for interactive runs, a live-updating job status table.
 - **Localization** — all messages in English or Russian (`language` config field or `--lang` flag).
 
 ## Requirements
 
-- Windows (the primary platform; automatic autostart installation is supported only there).
+- Windows, Linux or macOS.
 - To run from source — Node.js 18+.
-- The prebuilt `filekeeper.exe` (SEA build) works without Node.js installed.
+- The prebuilt `filekeeper.exe` (SEA build) works without Node.js installed (Windows only).
 
 ## Quick start
 
@@ -45,12 +45,12 @@ A background backup utility for Windows. It watches a source directory and copie
 
 ```
   1. Run (watch for changes in real time)
-  2. Install to autostart (administrator rights required)
-  3. Remove from autostart (administrator rights required)
+  2. Install to autostart (on Windows — as administrator)
+  3. Remove from autostart (on Windows — as administrator)
   4. Exit
 ```
 
-Install/remove automatically requests administrator rights (UAC) when needed.
+Install/remove automatically requests administrator rights (UAC) when needed. On Linux and macOS no elevated rights are required — autostart is installed for the current user.
 
 ## Command line usage
 
@@ -64,6 +64,16 @@ node index.js status    [--name=FileKeeper]                  check the task stat
 ```
 
 On startup, a full scan is **not** performed — real-time watching begins immediately. A full synchronization happens on schedule or when resuming an interrupted synchronization. If the utility was not running at the scheduled time, the synchronization runs at the next startup.
+
+## Linux / macOS
+
+The core (watching, synchronization, schedules, state file) is fully cross-platform. Platform specifics:
+
+- **Running from source.** Node.js 18+ is required: `node index.js --config=filekeeper.json`. The prebuilt `filekeeper.exe` is Windows-only; standalone binaries for Linux/macOS can be built on the target platform (e.g. `npm run build-cli`, pkg targets `node18-linux-x64` / `node18-macos-x64` are already declared in `package.json`).
+- **Autostart on Linux** — `node index.js install` creates a systemd user unit `~/.config/systemd/user/<name>.service` and enables it (`systemctl --user enable --now`). To keep the service running without a user login session: `sudo loginctl enable-linger $USER`.
+- **Autostart on macOS** — `node index.js install` creates a LaunchAgent `~/Library/LaunchAgents/com.filekeeper.<name>.plist` and loads it (`launchctl load -w`).
+- **`uninstall` / `status`** work correspondingly via `systemctl --user` / `launchctl`.
+- **`idle N` schedule** is supported on Windows and macOS (via `ioreg`); on Linux it is ignored with a warning.
 
 ## Configuration (`filekeeper.json`)
 
@@ -110,7 +120,7 @@ On startup, a full scan is **not** performed — real-time watching begins immed
 | ------------------------ | -------------------------------------------------------------- |
 | `"daily HH:MM"`        | Every day at the given time                                  |
 | `"weekly <day> HH:MM"` | Weekly (day:`sun`, `mon`, `tue`, `wed`, `thu`, `fri`, `sat`) |
-| `"idle N"`             | When the system has been idle for N minutes (Windows only)   |
+| `"idle N"`             | When the system has been idle for N minutes (Windows and macOS)   |
 | `"never"` or omitted   | No full synchronization is scheduled                         |
 
 ## State and log files
@@ -132,4 +142,4 @@ Other build variants: `npm run build` (pkg, Windows), `npm run build-cli` (pkg, 
 
 ## License
 
-ISC © EchoSystem — https://echosystem.ru
+MIT © EchoSystem - https://echosystem.ru
