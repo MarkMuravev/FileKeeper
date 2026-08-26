@@ -1,0 +1,12 @@
+    {
+        "debounce": 500,
+        "delete": true,
+        "verbose": false,
+        "schedule": "weekly sun 10:00",
+        "jobs": [
+            {
+                "source": "D:\\Media\\Photo",
+                "destination": "Z:\\Photo"
+            }
+        ]
+    }

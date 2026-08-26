@@ -1,0 +1,32 @@
+{
+  "name": "FileKeeper",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build": "pkg .",
+    "build-cli": "pkg --targets node18-linux-x64,node18-macos-x64,node18-win-x64 index.js",
+    "build-sea": "node build.js",
+    "build-sea-cli": "npx exe build.json"
+  },
+  "keywords": [],
+  "author": {
+    "name": "EchoSystem",
+    "email": "echosystem.ru@gmail.com",
+    "url": "https://echosystem.ru"
+  },
+  "license": "MIT",
+  "bin": "index.js",
+  "pkg": {
+    "targets": [
+      "node18-linux-x64",
+      "node18-macos-x64",
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "devDependencies": {
+    "@angablue/exe": "^3.2.5"
+  }
+}

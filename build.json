@@ -1,0 +1,14 @@
+{
+    "entry": "index.js",
+    "out": "./dist/filekeeper.exe",
+    "skipBundle": false,
+    "version": "{package:version}",
+    "icon": "logo.ico",
+    "executionLevel": "asInvoker",
+    "properties": {
+        "FileDescription": "{package:description}",
+        "ProductName": "FileKeeper",
+        "LegalCopyright": "Copyright {package:author.name}",
+        "OriginalFilename": "{package:name}"
+    }
+}

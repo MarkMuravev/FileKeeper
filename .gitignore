@@ -1,0 +1,12 @@
+node_modules/
+
+dist/filekeeper-state.json
+dist/filekeeper.json
+dist/filekeeper.log
+
+filekeeper-state.json
+filekeeper.log
+
+filekeeper-launcher.vbs
+
+_smoke/

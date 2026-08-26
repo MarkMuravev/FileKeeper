@@ -1,0 +1,16 @@
+    {
+        "language": "en",
+        "debounce": 500,
+        "delete": true,
+        "verbose": false,
+        "schedule": [
+            "daily 14:00",
+            "idle 60"
+        ],
+        "jobs": [
+            {
+                "source": "D:\\Media\\Photo",
+                "destination": "Z:\\Photo"
+            }
+        ]
+    }
